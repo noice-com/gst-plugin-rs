@@ -46,6 +46,8 @@ const D3D11_MEMORY_FEATURE: &str = "memory:D3D11Memory";
 
 const RTP_TWCC_URI: &str =
     "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01";
+const RTP_MID_URI: &str = "urn:ietf:params:rtp-hdrext:sdes:mid";
+const RTP_STREAM_ID_URI: &str = "urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id";
 
 const DEFAULT_STUN_SERVER: Option<&str> = Some("stun://stun.l.google.com:19302");
 const DEFAULT_MIN_BITRATE: u32 = 1000;
@@ -229,15 +231,21 @@ struct WebRTCPad {
     pad: gst::Pad,
     /// The (fixed) caps of the corresponding input stream
     in_caps: gst::Caps,
+    /// Original input stream caps before merging multiple caps to transceiver
+    out_caps: gst::Caps,
     /// The m= line index in the SDP
     media_idx: u32,
     ssrc: u32,
+    /// Allow sharing the same transceiver through mutual mid, for simulcast and such
+    mid: Option<String>,
     /// The name of the corresponding InputStream's sink_pad.
     /// When None, the pad was only created to mark its transceiver
     /// as inactive (in the case where we answer an offer).
     stream_name: Option<String>,
     /// The payload selected in the answer, None at first
     payload: Option<i32>,
+    /// Workaround for Codec helpers and payload type(s) registration
+    payload_remap: Option<i32>,
 }
 
 /// Wrapper around GStreamer encoder element, keeps track of factory
@@ -1285,36 +1293,43 @@ impl Session {
             }
         };
 
+        let payload = webrtc_pad.payload.unwrap();
+        let mut payload_remap = payload;
+        if let Some(pt) = webrtc_pad.payload_remap {
+            payload_remap = pt;
+        }
+
         gst::info!(
             CAT,
             obj: element,
-            "Connecting input stream {} for consumer {} and media {}",
+            "Connecting input stream {} for consumer {} and media {} payload remap {} -> {}",
             stream_name,
             self.peer_id,
-            webrtc_pad.media_idx
+            webrtc_pad.media_idx,
+            payload_remap,
+            payload
         );
 
-        let payload = webrtc_pad.payload.unwrap();
-
-        let codec = match self.codecs {
+        let mut codec = match self.codecs {
             Some(ref codecs) => {
                 gst::debug!(CAT, obj: element, "Picking codec from remote offer");
 
                 codecs
-                    .get(&payload)
+                    .get(&payload_remap)
                     .cloned()
-                    .ok_or_else(|| anyhow!("No codec for payload {}", payload))?
+                    .ok_or_else(|| anyhow!("No codec for payload {}", payload_remap))?
             }
             None => {
                 gst::debug!(CAT, obj: element, "Picking codec from local offer");
 
                 codecs
-                    .get(&payload)
+                    .get(&payload_remap)
                     .cloned()
-                    .ok_or_else(|| anyhow!("No codec for payload {}", payload))?
+                    .ok_or_else(|| anyhow!("No codec for payload {}", payload_remap))?
             }
         };
 
+        codec.set_pt(payload);
         let appsrc = make_element("appsrc", Some(stream_name))?;
         self.pipeline.add(&appsrc).unwrap();
 
@@ -1361,6 +1376,11 @@ impl Session {
             .pad
             .property::<gst_webrtc::WebRTCRTPTransceiver>("transceiver");
         transceiver.set_property("codec-preferences", None::<gst::Caps>);
+
+        let funnel_name = match transceiver.mid() {
+            Some(mid) => format!("transceiver_funnel_{}", mid.to_string()),
+            None => format!("transceiver_funnel_{}", webrtc_pad.ssrc),
+        };
 
         let mut global_caps = gst::Caps::new_empty_simple("application/x-unknown");
 
@@ -1436,19 +1456,37 @@ impl Session {
             }
         }
 
+        let funnel = match self.pipeline.by_name(funnel_name.as_str()) {
+            Some(funnel) => Some(funnel),
+            None => {
+                let funnel = make_element("funnel", Some(funnel_name.as_str()))?;
+                self.pipeline.add(&funnel).unwrap();
+
+                if let Some(parent_element) = webrtc_pad.pad.parent_element() {
+                    funnel.link_pads(
+                        Some("src"),
+                        &parent_element,
+                        Some(webrtc_pad.pad.name().as_str()),
+                    )?;
+                };
+
+                Some(funnel)
+            }
+        };
+
         let appsrc = appsrc.downcast::<gst_app::AppSrc>().unwrap();
         gst_utils::StreamProducer::configure_consumer(&appsrc);
         self.pipeline
             .sync_children_states()
-            .with_context(|| format!("Connecting input stream for {}", self.peer_id))?;
+            .with_context(|| format!("Synchronizing children states for {}", self.peer_id))?;
 
         encoding_chain.pay_filter.link(&pay_filter)?;
 
-        let srcpad = pay_filter.static_pad("src").unwrap();
-
-        srcpad
-            .link(&webrtc_pad.pad)
-            .with_context(|| format!("Connecting input stream for {}", self.peer_id))?;
+        if let Some(funnel) = funnel {
+            pay_filter
+                .link_pads(Some("src"), &funnel, Some("sink_%u"))
+                .with_context(|| format!("Connecting input stream for {}", self.peer_id))?;
+        }
 
         match producer.add_consumer(&appsrc) {
             Ok(link) => {
@@ -1520,6 +1558,18 @@ impl InputStream {
 
     fn msid(&self) -> Option<String> {
         self.sink_pad.property("msid")
+    }
+
+    fn mid(&self) -> Option<String> {
+        self.sink_pad.property("mid")
+    }
+
+    fn rid(&self) -> Option<String> {
+        self.sink_pad.property("rid")
+    }
+
+    fn rtp_extra(&self) -> Option<gst::Structure> {
+        self.sink_pad.property("rtp-extra")
     }
 }
 
@@ -1612,6 +1662,30 @@ impl BaseWebRTCSink {
         Ok(())
     }
 
+    fn configure_simulcast(
+        &self,
+        payloader: &gst::Element,
+        stream: &InputStream,
+    ) -> Result<(), Error> {
+        if let Some(mid) = stream.mid() {
+            gst::debug!(CAT, obj: payloader, "using mid={mid:?}");
+
+            if let Some(extension) = self.pick_extension(payloader, RTP_MID_URI) {
+                extension.set_property("mid", mid.as_str());
+            }
+        }
+
+        if let Some(rid) = stream.rid() {
+            gst::debug!(CAT, obj: payloader, "using rid={rid:?}");
+
+            if let Some(extension) = self.pick_extension(payloader, RTP_STREAM_ID_URI) {
+                extension.set_property("rid", rid.as_str());
+            }
+        }
+
+        Ok(())
+    }
+
     fn has_connected_payloader_setup_slots(&self) -> bool {
         use glib::{signal, subclass};
 
@@ -1677,6 +1751,58 @@ impl BaseWebRTCSink {
         }
     }
 
+    fn pick_extension(
+        &self,
+        payloader: &gst::Element,
+        extension_uri: &str,
+    ) -> Option<gst_rtp::RTPHeaderExtension> {
+        // GstRTPBasePayload::extensions property is only available since GStreamer 1.24
+        if !payloader.has_property("extensions", Some(gst::Array::static_type())) {
+            if self.has_connected_payloader_setup_slots() {
+                gst::warning!(CAT, "'extensions' property is not available: {} extension ID will default to 1. \
+    Application code must ensure to pick non-conflicting IDs for any additionally configured extensions. \
+    Please consider updating GStreamer to 1.24.", extension_uri);
+            }
+            return None;
+        }
+
+        let enabled_extensions: gst::Array = payloader.property("extensions");
+
+        let mid = enabled_extensions
+            .iter()
+            .find(|value| {
+                let value = value.get::<gst_rtp::RTPHeaderExtension>().unwrap();
+
+                match value.uri() {
+                    Some(v) => v == extension_uri,
+                    None => false,
+                }
+            })
+            .map(|value| value.get::<gst_rtp::RTPHeaderExtension>().unwrap());
+
+        if let Some(ext) = mid {
+            gst::debug!(CAT, obj: payloader, "{} extension is already mapped to id {} by application", extension_uri, ext.id());
+            return Some(ext);
+        }
+
+        let ext_id = utils::find_smallest_available_ext_id(
+            enabled_extensions
+                .iter()
+                .map(|value| value.get::<gst_rtp::RTPHeaderExtension>().unwrap().id()),
+        );
+
+        gst::debug!(CAT, obj: payloader, "Mapping {} extension to ID {}", extension_uri, ext_id);
+
+        if let Some(extension) = gst_rtp::RTPHeaderExtension::create_from_uri(extension_uri) {
+            extension.set_id(ext_id);
+            payloader.emit_by_name::<()>("add-extension", &[&extension]);
+            return Some(extension);
+        } else {
+            gst::warning!(CAT, obj: payloader, "Failed to add {} extension, make sure 'gst-plugins-good:rtpmanager' is installed", extension_uri);
+            return None;
+        }
+    }
+
     fn configure_payloader(
         &self,
         peer_id: &str,
@@ -1714,6 +1840,11 @@ impl BaseWebRTCSink {
             }
         }
 
+        let state = self.state.lock().unwrap();
+        if let Some(stream) = state.streams.get(stream_name) {
+            let _ = self.configure_simulcast(payloader, stream);
+        }
+
         self.configure_congestion_control(payloader, codec, extension_configuration_type)
     }
 
@@ -1731,47 +1862,122 @@ impl BaseWebRTCSink {
         }
     }
 
-    fn request_inactive_webrtcbin_pad(
+    fn modify_rtp_payloader_caps(
+        element: &super::BaseWebRTCSink,
+        stream: &mut InputStream,
+        in_caps: &mut gst::Caps,
+    ) {
+        let in_caps_mut = in_caps.make_mut();
+
+        if let Some(rtp_extra) = stream.rtp_extra() {
+            gst::debug!(CAT, obj: element, "using rtp_extra={rtp_extra:?}");
+
+            let st = in_caps_mut.structure_mut(0).unwrap();
+            rtp_extra.into_iter().for_each(|(key, value)| {
+                st.set(key, value.clone());
+            });
+        }
+    }
+
+    fn request_webrtcbin_pad_shared(
         element: &super::BaseWebRTCSink,
         webrtcbin: &gst::Element,
         webrtc_pads: &mut HashMap<u32, WebRTCPad>,
-        is_video: bool,
-    ) {
-        let ssrc = BaseWebRTCSink::generate_ssrc(element, webrtc_pads);
-        let media_idx = webrtc_pads.len() as i32;
+        mid: Option<String>,
+        in_caps: &gst::Caps,
+    ) -> Option<gst::Pad> {
+        let mut pad: Option<gst::Pad> = None;
+        let mut merged_caps = gst::Caps::new_empty();
 
-        let Some(pad) = webrtcbin.request_pad_simple(&format!("sink_{}", media_idx)) else {
+        if mid.is_some() {
+            let target_mid = mid.as_ref().unwrap();
+            for webrtc_pad in webrtc_pads.values() {
+                if let Some(candidate_mid) = &webrtc_pad.mid {
+                    if candidate_mid == target_mid {
+                        pad = Some(webrtc_pad.pad.clone());
+                        merged_caps.merge(webrtc_pad.out_caps.clone());
+                    }
+                }
+            }
+        };
+
+        if pad.is_none() {
+            let pads_len = webrtc_pads.len();
+            pad = webrtcbin.request_pad_simple(&format!("sink_{}", pads_len));
+        }
+
+        if pad.is_none() {
             gst::error!(CAT, obj: element, "Failed to request pad from webrtcbin");
             gst::element_error!(
                 element,
                 gst::StreamError::Failed,
                 ["Failed to request pad from webrtcbin"]
             );
+            return None;
+        };
+
+        merged_caps.merge(in_caps.clone());
+
+        gst::info!(
+            CAT,
+            obj: element,
+            "Requesting WebRTC pad with caps {}",
+            merged_caps
+        );
+
+        let transceiver = pad
+            .as_ref()
+            .unwrap()
+            .property::<gst_webrtc::WebRTCRTPTransceiver>("transceiver");
+        transceiver.set_property("codec-preferences", &merged_caps);
+
+        return pad;
+    }
+
+    fn request_inactive_webrtcbin_pad(
+        element: &super::BaseWebRTCSink,
+        webrtcbin: &gst::Element,
+        webrtc_pads: &mut HashMap<u32, WebRTCPad>,
+        is_video: bool,
+    ) {
+        let mut payloader_caps = gst::Caps::builder("application/x-rtp")
+            .field("media", if is_video { "video" } else { "audio" })
+            .build();
+
+        let payloader_caps_mut = payloader_caps.make_mut();
+        let ssrc = BaseWebRTCSink::generate_ssrc(element, webrtc_pads);
+        payloader_caps_mut.set("ssrc", ssrc);
+
+        let Some(pad) = BaseWebRTCSink::request_webrtcbin_pad_shared(
+            element,
+            webrtcbin,
+            webrtc_pads,
+            None,
+            &payloader_caps,
+        ) else {
             return;
         };
 
         let transceiver = pad.property::<gst_webrtc::WebRTCRTPTransceiver>("transceiver");
+        let media_idx = transceiver.mlineindex();
 
         transceiver.set_property(
             "direction",
             gst_webrtc::WebRTCRTPTransceiverDirection::Inactive,
         );
 
-        let payloader_caps = gst::Caps::builder("application/x-rtp")
-            .field("media", if is_video { "video" } else { "audio" })
-            .build();
-
-        transceiver.set_property("codec-preferences", &payloader_caps);
-
         webrtc_pads.insert(
             ssrc,
             WebRTCPad {
                 pad,
                 in_caps: gst::Caps::new_empty(),
-                media_idx: media_idx as u32,
+                out_caps: gst::Caps::new_empty(),
+                media_idx: media_idx,
                 ssrc,
+                mid: None,
                 stream_name: None,
                 payload: None,
+                payload_remap: None,
             },
         );
     }
@@ -1785,9 +1991,6 @@ impl BaseWebRTCSink {
         webrtc_pads: &mut HashMap<u32, WebRTCPad>,
         codecs: &mut BTreeMap<i32, Codec>,
     ) {
-        let ssrc = BaseWebRTCSink::generate_ssrc(element, webrtc_pads);
-        let media_idx = webrtc_pads.len() as i32;
-
         let mut payloader_caps = match media {
             Some(media) => {
                 let discovery_info = stream.create_discovery();
@@ -1807,14 +2010,14 @@ impl BaseWebRTCSink {
                         gst::debug!(
                             CAT,
                             obj: element,
-                            "Selected {codec:?} for media {media_idx}"
+                            "Selected {codec:?} for media",
                         );
 
                         codecs.insert(codec.payload().unwrap(), codec.clone());
                         codec.output_filter().unwrap()
                     }
                     None => {
-                        gst::error!(CAT, obj: element, "No codec selected for media {media_idx}");
+                        gst::error!(CAT, obj: element, "No codec selected for media");
 
                         gst::Caps::new_empty()
                     }
@@ -1832,22 +2035,30 @@ impl BaseWebRTCSink {
             );
         } else {
             let payloader_caps_mut = payloader_caps.make_mut();
+            let ssrc = BaseWebRTCSink::generate_ssrc(element, webrtc_pads);
             payloader_caps_mut.set("ssrc", ssrc);
 
-            gst::info!(
-                CAT,
-                obj: element,
-                "Requesting WebRTC pad with caps {}",
-                payloader_caps
-            );
+            let payload_remap = payloader_caps
+                .structure(0)
+                .unwrap()
+                .get_optional::<i32>("payload")
+                .unwrap();
 
-            let Some(pad) = webrtcbin.request_pad_simple(&format!("sink_{}", media_idx)) else {
-                gst::error!(CAT, obj: element, "Failed to request pad from webrtcbin");
-                gst::element_error!(
-                    element,
-                    gst::StreamError::Failed,
-                    ["Failed to request pad from webrtcbin"]
-                );
+            BaseWebRTCSink::modify_rtp_payloader_caps(element, stream, &mut payloader_caps);
+
+            let mid = payloader_caps
+                .structure(0)
+                .unwrap()
+                .get_optional::<String>("a-mid")
+                .unwrap();
+
+            let Some(pad) = BaseWebRTCSink::request_webrtcbin_pad_shared(
+                element,
+                webrtcbin,
+                webrtc_pads,
+                mid.clone(),
+                &payloader_caps,
+            ) else {
                 return;
             };
 
@@ -1857,13 +2068,12 @@ impl BaseWebRTCSink {
             }
 
             let transceiver = pad.property::<gst_webrtc::WebRTCRTPTransceiver>("transceiver");
+            let media_idx = transceiver.mlineindex();
 
             transceiver.set_property(
                 "direction",
                 gst_webrtc::WebRTCRTPTransceiverDirection::Sendonly,
             );
-
-            transceiver.set_property("codec-preferences", &payloader_caps);
 
             if stream.sink_pad.name().starts_with("video_") {
                 if settings.do_fec {
@@ -1878,10 +2088,13 @@ impl BaseWebRTCSink {
                 WebRTCPad {
                     pad,
                     in_caps: stream.in_caps.as_ref().unwrap().clone(),
-                    media_idx: media_idx as u32,
+                    out_caps: payloader_caps.clone(),
+                    media_idx: media_idx,
                     ssrc,
+                    mid,
                     stream_name: Some(stream.sink_pad.name().to_string()),
                     payload: None,
+                    payload_remap: payload_remap,
                 },
             );
         }
@@ -2820,7 +3033,7 @@ impl BaseWebRTCSink {
 
         let mut streams: Vec<InputStream> = state.streams.values().cloned().collect();
 
-        streams.sort_by_key(|s| s.serial);
+        streams.sort_unstable_by_key(|s| (s.is_video, s.serial));
 
         let element_clone = element.downgrade();
         let offer_clone = offer.cloned();
