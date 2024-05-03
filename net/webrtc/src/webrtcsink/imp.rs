@@ -1362,9 +1362,8 @@ impl Session {
             ) {
                 match self.cc_info.heuristic {
                     WebRTCSinkCongestionControl::Disabled => {
-                        // If congestion control is disabled, we simply use the highest
-                        // known "safe" value for the bitrate.
-                        let _ = enc.set_bitrate(element, self.cc_info.max_bitrate as i32);
+                        // The bitrate is set early to avoid interfering encoder-setup,
+                        // that might want to modify bitrate per track
                         enc.transceiver.set_property("fec-percentage", 50u32);
                     }
                     WebRTCSinkCongestionControl::Homegrown => {
@@ -4075,7 +4074,10 @@ impl ObjectImpl for BaseWebRTCSink {
 
                         let this = element.imp();
                         let settings = this.settings.lock().unwrap();
-                        configure_encoder(&enc, settings.cc_info.start_bitrate);
+                        match settings.cc_info.heuristic {
+                            WebRTCSinkCongestionControl::Disabled => configure_encoder(&enc, settings.cc_info.max_bitrate),
+                            _ => configure_encoder(&enc, settings.cc_info.start_bitrate),
+                        }
 
                         // Return false here so that latter handlers get called
                         Some(false.to_value())
