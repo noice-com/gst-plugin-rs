@@ -913,18 +913,16 @@ impl PayloadChainBuilder {
             elements.push(parser);
         }
 
-        // Only force the profile when output caps were not specified, either
-        // through input caps or because we are answering an offer
-        let force_profile = self.output_caps.is_any() && needs_encoding;
-        elements.push(
-            gst::ElementFactory::make("capsfilter")
-                .property("caps", self.codec.parser_caps(force_profile))
-                .build()
-                .with_context(|| "Failed to make element capsfilter")?,
-        );
-
         if let Some(ref encoded_filter) = self.encoded_filter {
             elements.push(encoded_filter.clone());
+        } else {
+            let force_profile = self.output_caps.is_any() && needs_encoding;
+            elements.push(
+                gst::ElementFactory::make("capsfilter")
+                    .property("caps", self.codec.parser_caps(force_profile))
+                    .build()
+                    .with_context(|| "Failed to make element capsfilter")?,
+            );
         }
 
         let pay = self
