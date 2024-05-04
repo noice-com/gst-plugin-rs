@@ -355,6 +355,7 @@ impl Signaller {
                         };
 
                         let mut disable_red = true;
+                        let mut is_stereo = false;
 
                         if mtype == proto::TrackType::Audio {
                             for format in media.formats() {
@@ -373,39 +374,133 @@ impl Signaller {
                         // Our SDP should always have a mid
                         let mid = media.attribute_val("mid").unwrap().to_string();
 
+                        let mut layers: Vec<proto::VideoLayer> = vec![];
                         let mut trackid = "";
+
                         for attr in media.attributes() {
+                            if attr.key() == "fmtp" {
+                                if let Some(val) = attr.value() {
+                                    if mtype == proto::TrackType::Audio
+                                        && val.contains("sprop-stereo=1")
+                                    {
+                                        is_stereo = true;
+                                    }
+                                }
+                            }
+
+                            if attr.key() == "rid" {
+                                if let Some(val) = attr.value() {
+                                    let split: Vec<&str> = val.split_whitespace().collect();
+                                    if split.len() < 2 {
+                                        continue;
+                                    }
+
+                                    let rid = split[0];
+                                    let direction = split[1];
+
+                                    if direction != "send" {
+                                        continue;
+                                    }
+
+                                    if mtype != proto::TrackType::Video {
+                                        continue;
+                                    }
+
+                                    let mut layer = proto::VideoLayer {
+                                        quality: match rid {
+                                            "f" => proto::VideoQuality::High as i32,
+                                            "h" => proto::VideoQuality::Medium as i32,
+                                            "q" => proto::VideoQuality::Low as i32,
+                                            _ => proto::VideoQuality::Off as i32,
+                                        },
+                                        ..Default::default()
+                                    };
+
+                                    if layer.quality == (proto::VideoQuality::Off as i32) {
+                                        continue;
+                                    }
+
+                                    let attrs: HashMap<&str, &str> = split
+                                        .get(2)
+                                        .unwrap_or(&"")
+                                        .split(";")
+                                        .map(|s| s.split_once("=").unwrap_or_default())
+                                        .map(|(key, val)| (key, val))
+                                        .collect();
+                                    for (key, value) in attrs.into_iter() {
+                                        match key {
+                                            "max-width" => {
+                                                if let Ok(v) = value.parse::<u32>() {
+                                                    layer.width = v;
+                                                }
+                                            }
+                                            "max-height" => {
+                                                if let Ok(v) = value.parse::<u32>() {
+                                                    layer.height = v;
+                                                }
+                                            }
+                                            "max-br" => {
+                                                if let Ok(v) = value.parse::<u32>() {
+                                                    layer.bitrate = v;
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    layers.push(layer);
+                                }
+                            }
+
                             if attr.key() == "ssrc" {
                                 if let Some(val) = attr.value() {
                                     let split: Vec<&str> = val.split_whitespace().collect();
                                     if split.len() == 3 && split[1].starts_with("msid:") {
                                         trackid = split[2];
-                                        break;
                                     }
                                 }
                             }
                         }
 
-                        let layers = if mtype == proto::TrackType::Video {
-                            vec![proto::VideoLayer {
+                        if layers.len() == 0 && mtype == proto::TrackType::Video {
+                            layers.push(proto::VideoLayer {
                                 quality: proto::VideoQuality::High as i32,
                                 ..Default::default()
-                            }]
-                        } else {
-                            vec![]
-                        };
+                            });
+                        }
 
-                        let req = proto::AddTrackRequest {
+                        // livekit quality selector compares against height
+                        layers.sort_by_key(|x| x.height);
+
+                        let (mut max_width, mut max_height) = (0 as u32, 0 as u32);
+                        for layer in layers.iter() {
+                            if layer.width > max_width && layer.height > max_height {
+                                max_width = layer.width;
+                                max_height = layer.height;
+                            }
+                        }
+
+                        let mut req = proto::AddTrackRequest {
                             cid: trackid.to_string(),
                             name: mid.clone(),
                             r#type: mtype as i32,
                             muted: false,
                             source: msource,
-                            disable_dtx: true,
-                            disable_red,
                             layers,
                             ..Default::default()
                         };
+
+                        match mtype {
+                            proto::TrackType::Video => {
+                                req.width = max_width;
+                                req.height = max_height;
+                            }
+                            proto::TrackType::Audio => {
+                                req.disable_dtx = true;
+                                req.stereo = is_stereo;
+                                req.disable_red = disable_red;
+                            }
+                            _ => {}
+                        }
 
                         let (tx, rx) = oneshot::channel();
                         if let Some(connection) = &mut *imp.connection.lock().unwrap() {
