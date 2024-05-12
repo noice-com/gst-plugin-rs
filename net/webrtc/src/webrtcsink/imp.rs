@@ -1404,7 +1404,10 @@ impl Session {
             if key.starts_with("a-") {
                 None
             } else {
-                Some((key, value.to_owned()))
+                match key.as_str() {
+                    "payload" | "profile" | "level" | "profile-level-id" => None,
+                    _ => Some((key, value.to_owned())),
+                }
             }
         }));
         filtered_s.set("ssrc", webrtc_pad.ssrc);
