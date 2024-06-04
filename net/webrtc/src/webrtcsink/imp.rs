@@ -3817,7 +3817,16 @@ impl BaseWebRTCSink {
         // a renegotiation.
         let caps_type = current.name();
         if caps_type.starts_with("video/") {
-            const VIDEO_ALLOWED_CHANGES: &[&str] = &["width", "height", "framerate"];
+            const VIDEO_ALLOWED_CHANGES: &[&str] = &[
+                "width",
+                "height",
+                "framerate",
+                "pixel-aspect-ratio",
+                "codec_data",
+                "multiview-mode",
+                "multiview-flags",
+                "chroma-site",
+            ];
 
             current.remove_fields(VIDEO_ALLOWED_CHANGES.iter().copied());
             new.remove_fields(VIDEO_ALLOWED_CHANGES.iter().copied());
