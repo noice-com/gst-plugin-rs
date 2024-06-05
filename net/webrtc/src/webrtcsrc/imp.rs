@@ -246,6 +246,17 @@ impl ObjectImpl for BaseWebRTCSrc {
                     ])
                     .return_type::<gst::Element>()
                     .build(),
+                /**
+                 * GstBaseWebRTCSrc::webrtcbin-ready:
+                 * @peer_id: Id of the consumer/producer
+                 * @webrtcbin: The internal WebRTCBin element
+                 *
+                 * This signal can be used to tweak @webrtcbin, creating a data
+                 * channel for example.
+                 */
+                glib::subclass::Signal::builder("webrtcbin-ready")
+                    .param_types([String::static_type(), gst::Element::static_type()])
+                    .build(),
             ]
         });
 
@@ -569,6 +580,8 @@ impl BaseWebRTCSrc {
             }),
         );
 
+        self.obj()
+            .emit_by_name::<()>("webrtcbin-ready", &[&"none", &webrtcbin]);
         self.signaller()
             .emit_by_name::<()>("webrtcbin-ready", &[&"none", &webrtcbin]);
 
