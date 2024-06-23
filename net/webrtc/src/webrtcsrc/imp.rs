@@ -580,7 +580,8 @@ impl BaseWebRTCSrc {
             }),
         );
 
-        self.obj().emit_by_name::<()>("webrtcbin-ready", &[&"none", &webrtcbin]);
+        self.obj()
+            .emit_by_name::<()>("webrtcbin-ready", &[&"none", &webrtcbin]);
         self.signaller()
             .emit_by_name::<()>("webrtcbin-ready", &[&"none", &webrtcbin]);
 
