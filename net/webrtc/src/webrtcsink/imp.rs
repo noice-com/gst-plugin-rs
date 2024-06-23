@@ -576,11 +576,22 @@ impl Default for State {
 fn make_converter_for_video_caps(caps: &gst::Caps, codec: &Codec) -> Result<gst::Element, Error> {
     assert!(caps.is_fixed());
 
+    let ret = gst::Bin::default();
     let video_info = gst_video::VideoInfo::from_caps(caps)?;
 
-    let ret = gst::Bin::default();
+    let vrate = {
+        if video_info.fps().numer() != 0 {
+            let vrate = make_element("videorate", None)?;
+            vrate.set_property("drop-only", true);
+            vrate.set_property("skip-to-first", true);
+            ret.add(&vrate)?;
+            Some(vrate)
+        } else {
+            None
+        }
+    };
 
-    let (head, mut tail) = {
+    let (mut head, tail) = {
         if let Some(feature) = caps.features(0) {
             if feature.contains(NVMM_MEMORY_FEATURE)
                 // NVIDIA V4L2 encoders require NVMM memory as input and that requires using the
@@ -664,18 +675,13 @@ fn make_converter_for_video_caps(caps: &gst::Caps, codec: &Codec) -> Result<gst:
         }
     };
 
+    if let Some(vrate) = vrate {
+        vrate.link(&head)?;
+        head = vrate;
+    }
+
     ret.add_pad(&gst::GhostPad::with_target(&head.static_pad("sink").unwrap()).unwrap())
         .unwrap();
-
-    if video_info.fps().numer() != 0 {
-        let vrate = make_element("videorate", None)?;
-        vrate.set_property("drop-only", true);
-        vrate.set_property("skip-to-first", true);
-
-        ret.add(&vrate)?;
-        tail.link(&vrate)?;
-        tail = vrate;
-    }
 
     ret.add_pad(&gst::GhostPad::with_target(&tail.static_pad("src").unwrap()).unwrap())
         .unwrap();
