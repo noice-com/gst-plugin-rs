@@ -592,6 +592,12 @@ fn make_converter_for_video_caps(caps: &gst::Caps, codec: &Codec) -> Result<gst:
     };
 
     let (mut head, tail) = {
+        let hw_pix_fmt = caps
+            .structure(0)
+            .unwrap()
+            .get_optional::<i32>("hw_pix_fmt")
+            .unwrap();
+
         if let Some(feature) = caps.features(0) {
             if feature.contains(NVMM_MEMORY_FEATURE)
                 // NVIDIA V4L2 encoders require NVMM memory as input and that requires using the
@@ -655,6 +661,15 @@ fn make_converter_for_video_caps(caps: &gst::Caps, codec: &Codec) -> Result<gst:
                 gst::Element::link_many([&glupload, &glconvert, &glscale])?;
 
                 (glupload, glscale)
+            } else if let Some(118) = hw_pix_fmt {
+                // PIX_FMT_NI_QUADRA
+                let convert = make_element("videoconvert", None)?;
+                let scale = make_element("niquadrascale", None)?;
+
+                ret.add_many([&convert, &scale])?;
+                gst::Element::link_many([&convert, &scale])?;
+
+                (convert, scale)
             } else {
                 let convert = make_element("videoconvert", None)?;
                 let scale = make_element("videoscale", None)?;
